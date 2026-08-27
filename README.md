@@ -39,9 +39,65 @@ The wheel contains `gpuctl`, `gpuctld`, and the agent skill. Publish it as a
 GitHub Release asset, upload it to an internal artifact registry, or copy it
 directly to the GPU host.
 
-## Install on the GPU host
+## Install or upgrade on the GPU host
 
-### Recommended: use a dedicated virtual environment
+Run the installer from the repository root as a regular user:
+
+```bash
+./install.sh
+```
+
+The script:
+
+1. Runs the test suite and builds a wheel in `dist/`.
+2. Installs or reinstalls that wheel in `/opt/gpuctl`.
+3. Links `gpuctl` and `gpuctld` into `/usr/local/bin`.
+4. Creates the daemon configuration on the first install, installs the systemd
+   unit, and restarts `gpuctld`.
+5. Refreshes the packaged Copilot and Claude skills for the user running the
+   installer.
+
+If that user already has a pip user installation at `~/.local/bin/gpuctl`, the
+script refreshes it from the same wheel so it cannot shadow the machine-wide
+command with stale code.
+
+The first install detects numeric `/dev/nvidiaN` devices automatically. Pass an
+explicit ordered card list to override detection or change an existing
+configuration:
+
+```bash
+./install.sh --cards 0,1,2,3
+```
+
+Subsequent runs preserve `/etc/gpuctl/gpuctld.env` unless `--cards` is supplied.
+The installer refuses to restart the daemon while tasks are active or queued.
+Wait until it is idle, or use `--force-restart` only when intentionally
+discarding all in-memory tasks and locks during coordinated maintenance.
+Already-running workloads are not killed and would continue without tracked
+leases.
+
+Useful options:
+
+```bash
+./install.sh --skip-tests
+./install.sh --build-only
+./install.sh --skip-skill
+```
+
+Do not run the script with `sudo`; it requests administrator access only for
+the machine-wide files and service. Other users can use `gpuctl` immediately
+afterward. Each user who wants the agent integration must separately run:
+
+```bash
+gpuctl install-skill
+```
+
+The default skill refresh uses `--force`. Use `--skip-skill` if the invoking
+user has locally modified either packaged skill.
+
+### Manual package installation
+
+#### Recommended: use a dedicated virtual environment
 
 This approach does not modify system Python packages:
 
@@ -70,7 +126,7 @@ sudo python3 -m pip install ./gpuctl-0.1.0-py3-none-any.whl
 This is a machine-wide installation. Individual users do not need separate
 program installations because `/usr/local/bin/gpuctl` is available to everyone.
 
-## Deploy gpuctld
+## Manual daemon deployment
 
 The daemon must be configured with the cards it manages. Their order is also the
 selection order used for automatic `--count` allocations.
@@ -338,16 +394,12 @@ gpuctl --count 2 --set-cuda-visible-devices -- \
 
 ## Upgrade
 
-After building and copying a new wheel:
+Pull or otherwise update the checkout, then rerun the installer:
 
 ```bash
-sudo /opt/gpuctl/bin/python -m pip install --upgrade \
-  ./gpuctl-0.1.0-py3-none-any.whl
-sudo systemctl restart gpuctld
+git pull
+./install.sh
 ```
 
-Each user should then refresh the installed agent skill:
-
-```bash
-gpuctl install-skill --force
-```
+The wheel is force-reinstalled even when the package version has not changed,
+so rerunning the script also deploys development snapshots.
