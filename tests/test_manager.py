@@ -179,3 +179,51 @@ class LeaseManagerTest(unittest.TestCase):
             uid=1001,
         )
         self.assertEqual(waiting_state["status"], "granted")
+
+    def test_timed_reservation_uses_fixed_expiry(self) -> None:
+        manager = LeaseManager(("0",), lease_ttl=0.05, queue_ttl=1.0)
+        self.addCleanup(manager.close)
+        reservation = manager.create_request(
+            owner="manual reservation",
+            cards=["0"],
+            uid=1000,
+            user="alice",
+            command="gpuctl grab --cards 0 --for 0.15s",
+            reservation_seconds=0.15,
+        )
+        self.assertEqual(manager.status()["tasks"][0]["status"], "reserved")
+        self.assertIn("reservation_ends_at", reservation["lease"])
+
+        time.sleep(0.07)
+        manager.renew_lease(reservation["lease"]["lease_id"], uid=1000)
+        self.assertEqual(manager.status()["summary"]["free_cards"], 0)
+
+        deadline = time.monotonic() + 0.3
+        while time.monotonic() < deadline:
+            if manager.status()["summary"]["free_cards"] == 1:
+                break
+            time.sleep(0.01)
+        else:
+            self.fail("timed reservation did not expire")
+        self.assertEqual(manager.status()["tasks"], [])
+
+    def test_canceling_reservation_immediately_unblocks_queue(self) -> None:
+        reservation = self.manager.create_request(
+            owner="manual reservation",
+            cards=["0"],
+            uid=1000,
+            user="alice",
+            command="gpuctl grab --cards 0 --for 1h",
+            reservation_seconds=3600,
+        )
+        waiting = self.manager.create_request(
+            owner="training",
+            cards=["0"],
+            uid=1001,
+            user="bob",
+            command="python train.py",
+        )
+
+        self.manager.request_task_cancel(reservation["task_id"], uid=1000)
+        waiting_state = self.manager.get_request(waiting["task_id"], uid=1001)
+        self.assertEqual(waiting_state["status"], "granted")

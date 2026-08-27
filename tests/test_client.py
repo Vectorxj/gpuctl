@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -189,6 +190,41 @@ class ClientIntegrationTest(unittest.TestCase):
 
         api.cancel_request(queued["task_id"])
         api.release_lease(running["lease"]["lease_id"])
+
+    def test_raw_grab_creates_detached_timed_reservation(self) -> None:
+        stdout = io.StringIO()
+        started = time.monotonic()
+        with contextlib.redirect_stdout(stdout):
+            result = main(
+                [
+                    "grab",
+                    "--socket",
+                    self.socket_path,
+                    "--count",
+                    "1",
+                    "--for",
+                    "1s",
+                    "--json",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        self.assertLess(time.monotonic() - started, 0.5)
+        reservation = json.loads(stdout.getvalue())
+        self.assertEqual(len(reservation["task_id"]), 16)
+        self.assertEqual(reservation["duration_seconds"], 1.0)
+        self.assertEqual(len(reservation["cards"]), 1)
+
+        api = APIClient(self.socket_path, timeout=1.0)
+        tasks = api.tasks()["tasks"]
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0]["status"], "reserved")
+        self.assertEqual(tasks[0]["task_id"], reservation["task_id"])
+        self.assertIn("gpuctl grab", tasks[0]["command"])
+        self.assertIn("reservation_ends_at", tasks[0])
+
+        api.cancel_task(reservation["task_id"])
+        self.assertEqual(api.status()["summary"]["free_cards"], 2)
 
     def test_cancel_command_stops_running_task(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

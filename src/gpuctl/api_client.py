@@ -58,11 +58,14 @@ class APIClient:
         cards: tuple[str, ...] | None,
         count: int | None,
         command: str,
+        reservation_seconds: float | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "owner": owner,
             "command": command,
         }
+        if reservation_seconds is not None:
+            payload["reservation_seconds"] = reservation_seconds
         if cards is not None:
             payload["cards"] = list(cards)
         else:

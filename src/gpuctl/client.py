@@ -181,7 +181,7 @@ def build_run_parser() -> argparse.ArgumentParser:
         prog="gpuctl",
         description="Acquire GPU cards, run a command, and release the cards.",
         epilog=(
-            "Other commands: gpuctl status, gpuctl jobs, "
+            "Other commands: gpuctl grab, gpuctl status, gpuctl jobs, "
             "gpuctl cancel TASK_ID, gpuctl install-skill"
         ),
     )
@@ -241,6 +241,55 @@ def build_status_parser() -> argparse.ArgumentParser:
     )
     _add_connection_arguments(parser)
     parser.add_argument("--json", action="store_true", help="print raw JSON")
+    return parser
+
+
+def build_grab_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="gpuctl grab",
+        description="Reserve GPU cards for a fixed duration without running a command.",
+    )
+    _add_connection_arguments(parser)
+    allocation = parser.add_mutually_exclusive_group(required=True)
+    allocation.add_argument(
+        "--cards",
+        type=cards_argument,
+        metavar="ID,ID,...",
+        help="wait for these exact card IDs",
+    )
+    allocation.add_argument(
+        "--count",
+        "--gpus",
+        dest="count",
+        type=int,
+        metavar="N",
+        help="reserve N currently free cards",
+    )
+    parser.add_argument(
+        "--for",
+        dest="duration",
+        required=True,
+        type=duration_argument,
+        metavar="DURATION",
+        help="reservation duration, such as 30m or 2h",
+    )
+    parser.add_argument("--owner", default=_default_owner(), help="owner label")
+    parser.add_argument(
+        "--wait-timeout",
+        type=duration_argument,
+        default=0.0,
+        metavar="DURATION",
+        help="maximum queue wait; 0 means no limit (default: 0)",
+    )
+    parser.add_argument(
+        "--poll-interval",
+        type=duration_argument,
+        default=0.5,
+        metavar="DURATION",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("--quiet", action="store_true", help="suppress text output")
+    parser.add_argument("--json", action="store_true", help="print reservation JSON")
     return parser
 
 
@@ -306,6 +355,7 @@ def _acquire(
     signals: SignalState,
     stderr: TextIO,
     command: list[str],
+    reservation_seconds: float | None = None,
 ) -> dict[str, Any]:
     if args.count is not None and args.count <= 0:
         raise ClientFailure("--count must be positive")
@@ -322,6 +372,7 @@ def _acquire(
         cards=args.cards,
         count=args.count,
         command=command_display,
+        reservation_seconds=reservation_seconds,
     )
     request_id = str(state["request_id"])
     acquired = False
@@ -546,6 +597,51 @@ def _run(args: argparse.Namespace, stderr: TextIO) -> int:
         return _execute(api, lease, command, args, signals, stderr)
 
 
+def _grab(args: argparse.Namespace, stdout: TextIO, stderr: TextIO) -> int:
+    if args.duration < 1.0:
+        raise ClientFailure("--for must be at least 1s")
+    if args.count is not None and args.count <= 0:
+        raise ClientFailure("--count must be positive")
+
+    if args.cards is not None:
+        allocation = ["--cards", ",".join(args.cards)]
+    else:
+        allocation = ["--count", str(args.count)]
+    display_command = ["gpuctl", "grab", *allocation, "--for", f"{args.duration:g}s"]
+
+    api = _api_from_args(args)
+    with SignalState() as signals:
+        lease = _acquire(
+            api,
+            args,
+            signals,
+            stderr,
+            display_command,
+            reservation_seconds=args.duration,
+        )
+        signum = signals.pop()
+        if signum is not None:
+            api.cancel_task(str(lease["task_id"]))
+            return min(128 + signum, 255)
+
+    result = {
+        "task_id": str(lease["task_id"]),
+        "cards": [str(card) for card in lease["cards"]],
+        "expires_at": str(lease["reservation_ends_at"]),
+        "duration_seconds": float(lease["reservation_seconds"]),
+    }
+    if args.json:
+        json.dump(result, stdout, indent=2, sort_keys=True)
+        print(file=stdout)
+    elif not args.quiet:
+        print(
+            f"Reserved cards {','.join(result['cards'])} until "
+            f"{result['expires_at']} (task {result['task_id']}).",
+            file=stdout,
+        )
+    return 0
+
+
 def _format_duration(value: Any) -> str:
     if value is None:
         return "-"
@@ -560,7 +656,7 @@ def _format_duration(value: Any) -> str:
 
 
 def _task_request(task: dict[str, Any]) -> str:
-    if task.get("status") in {"running", "canceling"}:
+    if task.get("status") in {"running", "reserved", "canceling"}:
         return ",".join(str(card) for card in task.get("cards", []))
     if "requested_cards" in task:
         return "want:" + ",".join(
@@ -575,7 +671,7 @@ def _print_tasks(tasks: list[dict[str, Any]], stdout: TextIO) -> None:
         return
     print(
         f"{'TASK ID':<16} {'USER':<12} {'STATE':<8} {'CARDS':<14} "
-        f"{'QUEUED':<8} {'RUNNING':<8} COMMAND",
+        f"{'QUEUED':<8} {'RUNNING':<8} {'UNTIL':<24} COMMAND",
         file=stdout,
     )
     for task in tasks:
@@ -589,6 +685,7 @@ def _print_tasks(tasks: list[dict[str, Any]], stdout: TextIO) -> None:
             f"{_task_request(task):<14} "
             f"{_format_duration(task.get('queued_for_seconds')):<8} "
             f"{_format_duration(task.get('running_for_seconds')):<8} "
+            f"{str(task.get('reservation_ends_at', '-')):<24} "
             f"{command}",
             file=stdout,
         )
@@ -596,7 +693,7 @@ def _print_tasks(tasks: list[dict[str, Any]], stdout: TextIO) -> None:
 
 def _print_status(status: dict[str, Any], stdout: TextIO) -> None:
     print(
-        f"{'CARD':<16} {'STATE':<8} {'USER':<12} {'TASK ID':<16} EXPIRES",
+        f"{'CARD':<16} {'STATE':<8} {'USER':<12} {'TASK ID':<16} LEASE UNTIL",
         file=stdout,
     )
     for card in status.get("cards", []):
@@ -655,6 +752,9 @@ def _install_skill(args: argparse.Namespace, stdout: TextIO) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(argv) if argv is not None else sys.argv[1:]
     try:
+        if arguments and arguments[0] == "grab":
+            args = build_grab_parser().parse_args(arguments[1:])
+            return _grab(args, sys.stdout, sys.stderr)
         if arguments and arguments[0] == "status":
             args = build_status_parser().parse_args(arguments[1:])
             return _status(args, sys.stdout)

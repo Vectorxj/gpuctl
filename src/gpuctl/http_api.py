@@ -216,6 +216,7 @@ class GPURequestHandler(BaseHTTPRequestHandler):
                 user=caller.user,
                 client_pid=caller.pid,
                 command=body.get("command"),
+                reservation_seconds=body.get("reservation_seconds"),
             )
             self._send_json(201, state)
             return

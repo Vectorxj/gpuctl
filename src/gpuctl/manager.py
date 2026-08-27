@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import math
 import secrets
 import threading
 import time
@@ -52,6 +53,7 @@ class _Request:
     client_pid: int | None
     owner: str
     command: str | None
+    reservation_seconds: float | None
     cards: tuple[str, ...] | None
     count: int | None
     enqueued_at: str
@@ -73,6 +75,7 @@ class _Lease:
     uid: int
     user: str
     owner: str
+    reservation_seconds: float | None
     cards: tuple[str, ...]
     deadline: float
     expires_at: str
@@ -129,17 +132,19 @@ class LeaseManager:
         user: str | None = None,
         client_pid: int | None = None,
         command: str | None = None,
+        reservation_seconds: float | None = None,
     ) -> dict[str, Any]:
         owner_value, card_values, count_value = self._validate_request(
             owner=owner,
             cards=cards,
             count=count,
         )
-        user_value, command_value = self._validate_metadata(
+        user_value, command_value, reservation_value = self._validate_metadata(
             uid=uid,
             user=user,
             client_pid=client_pid,
             command=command,
+            reservation_seconds=reservation_seconds,
             owner=owner_value,
         )
         now = time.monotonic()
@@ -157,6 +162,7 @@ class LeaseManager:
                 client_pid=client_pid,
                 owner=owner_value,
                 command=command_value,
+                reservation_seconds=reservation_value,
                 cards=card_values,
                 count=count_value,
                 enqueued_at=_timestamp_now(),
@@ -236,8 +242,9 @@ class LeaseManager:
                 raise TaskCanceledError(
                     f"task {request.request_id} has been canceled"
                 )
-            lease.deadline = now + self._lease_ttl
-            lease.expires_at = _timestamp_after(self._lease_ttl)
+            if request.reservation_seconds is None:
+                lease.deadline = now + self._lease_ttl
+                lease.expires_at = _timestamp_after(self._lease_ttl)
             self._condition.notify_all()
             return self._lease_snapshot_locked(lease, now)
 
@@ -278,6 +285,9 @@ class LeaseManager:
             if request.status == "queued":
                 self._requests.pop(task_id, None)
                 self._remove_from_queue_locked(task_id)
+                self._schedule_locked(now)
+            elif request.reservation_seconds is not None and request.lease_id is not None:
+                self._release_lease_locked(request.lease_id)
                 self._schedule_locked(now)
             elif request.status == "granted":
                 request.status = "canceling"
@@ -417,8 +427,9 @@ class LeaseManager:
         user: str | None,
         client_pid: int | None,
         command: str | None,
+        reservation_seconds: float | None,
         owner: str,
-    ) -> tuple[str, str | None]:
+    ) -> tuple[str, str | None, float | None]:
         if isinstance(uid, bool) or not isinstance(uid, int) or uid < -1:
             raise ValidationError("uid must be a non-negative integer")
         if user is None:
@@ -444,7 +455,16 @@ class LeaseManager:
             command = command.strip()
             if len(command) > 2048:
                 raise ValidationError("command must be at most 2048 characters")
-        return user_value, command
+        if reservation_seconds is not None:
+            if (
+                isinstance(reservation_seconds, bool)
+                or not isinstance(reservation_seconds, (int, float))
+                or not math.isfinite(reservation_seconds)
+                or reservation_seconds <= 0
+            ):
+                raise ValidationError("reservation_seconds must be positive")
+            reservation_seconds = float(reservation_seconds)
+        return user_value, command, reservation_seconds
 
     def _maintain_locked(self, now: float) -> None:
         expired_leases = [
@@ -480,15 +500,21 @@ class LeaseManager:
                 return
 
             self._queue.popleft()
+            lease_duration = (
+                request.reservation_seconds
+                if request.reservation_seconds is not None
+                else self._lease_ttl
+            )
             lease = _Lease(
                 lease_id=secrets.token_urlsafe(32),
                 request_id=request_id,
                 uid=request.uid,
                 user=request.user,
                 owner=request.owner,
+                reservation_seconds=request.reservation_seconds,
                 cards=selected_cards,
-                deadline=now + self._lease_ttl,
-                expires_at=_timestamp_after(self._lease_ttl),
+                deadline=now + lease_duration,
+                expires_at=_timestamp_after(lease_duration),
             )
             self._leases[lease.lease_id] = lease
             for card in selected_cards:
@@ -541,6 +567,7 @@ class LeaseManager:
             "client_pid": request.client_pid,
             "owner": request.owner,
             "command": request.command,
+            "reservation_seconds": request.reservation_seconds,
             "enqueued_at": request.enqueued_at,
             "queue_ttl_seconds": self._queue_ttl,
         }
@@ -568,6 +595,7 @@ class LeaseManager:
             "client_pid": request.client_pid,
             "owner": request.owner,
             "command": request.command,
+            "reservation_seconds": request.reservation_seconds,
             "enqueued_at": request.enqueued_at,
             "queued_for_seconds": self._queued_duration_locked(request, now),
         }
@@ -585,6 +613,12 @@ class LeaseManager:
             result["running_for_seconds"] = max(0.0, now - request.started_mono)
             result["expires_at"] = lease.expires_at
             result["remaining_seconds"] = max(0.0, lease.deadline - now)
+            if request.reservation_seconds is not None:
+                result["reservation_ends_at"] = lease.expires_at
+                result["reservation_remaining_seconds"] = max(
+                    0.0,
+                    lease.deadline - now,
+                )
             if request.status == "canceling":
                 result["cancel_requested_at"] = request.cancel_requested_at
                 result["canceled_by_uid"] = request.canceled_by_uid
@@ -596,21 +630,31 @@ class LeaseManager:
 
     def _public_task_status(self, request: _Request) -> str:
         if request.status == "granted":
+            if request.reservation_seconds is not None:
+                return "reserved"
             return "running"
         return request.status
 
     def _lease_snapshot_locked(self, lease: _Lease, now: float) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "lease_id": lease.lease_id,
             "task_id": lease.request_id,
             "uid": lease.uid,
             "user": lease.user,
             "owner": lease.owner,
+            "reservation_seconds": lease.reservation_seconds,
             "cards": list(lease.cards),
             "expires_at": lease.expires_at,
             "ttl_seconds": self._lease_ttl,
             "remaining_seconds": max(0.0, lease.deadline - now),
         }
+        if lease.reservation_seconds is not None:
+            result["reservation_ends_at"] = lease.expires_at
+            result["reservation_remaining_seconds"] = max(
+                0.0,
+                lease.deadline - now,
+            )
+        return result
 
     def _authorize_request_locked(
         self,

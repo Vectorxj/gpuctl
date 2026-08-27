@@ -14,7 +14,7 @@ responsible for ensuring that commands use only their allocated cards.
 | Component | Purpose |
 |---|---|
 | `gpuctld` | Local daemon that manages tasks, card locks, the FIFO queue, and fallback lease recovery |
-| `gpuctl` | Acquires cards, runs commands, lists or cancels tasks, renews leases, and releases cards |
+| `gpuctl` | Acquires cards, runs commands, creates timed reservations, lists or cancels tasks, renews leases, and releases cards |
 | `gpuctl-gpu` skill | Instructs Copilot, Claude Code, and other agents to use `gpuctl` before GPU work |
 | `contrib/gpuctld.service` | systemd service unit |
 
@@ -304,21 +304,24 @@ gpuctl status --json
 `status` lists every active task:
 
 ```text
-TASK ID          USER         STATE    CARDS          QUEUED   RUNNING  COMMAND
-5f81aeb1639f66af alice        running  0,1            4s       12m03s   torchrun --nproc-per-node=2 train.py
-a1d0778642ea94dc bob          queued   want:2         31s      -        python eval.py
+TASK ID          USER         STATE    CARDS          QUEUED   RUNNING UNTIL                    COMMAND
+5f81aeb1639f66af alice        running  0,1            4s       12m03s  -                        torchrun --nproc-per-node=2 train.py
+a1d0778642ea94dc bob          queued   want:2         31s      -       -                        python eval.py
+7ac91f4e80a6fd21 carol        reserved 3              2s       8m11s   2026-08-27T16:00:00.000Z gpuctl grab --cards 3 --for 1h
 ```
 
 Each task has a unique 16-character ID and one of these states:
 
 - `queued`: waiting in the strict FIFO queue
 - `running`: cards have been allocated and the command is running
+- `reserved`: a raw timed reservation is holding its allocated cards
 - `canceling`: cancellation was requested; cards remain locked while the client
   stops the command and releases its lease
 
 `QUEUED` is the time spent waiting before allocation. `RUNNING` is the time
 elapsed since allocation. While waiting, `CARDS` shows the request; while
-running, it shows the actual allocation.
+running or reserved, it shows the actual allocation. `UNTIL` is set only for a
+fixed-duration raw reservation.
 
 List and cancel tasks owned by the current user:
 
@@ -345,6 +348,52 @@ Limit queue wait time with:
 gpuctl --count 2 --wait-timeout 20m -- python train.py
 ```
 
+### Runtime, lease expiry, and timed reservations
+
+`RUNNING` in `gpuctl status` is an observed duration measured from card
+allocation. It is not a configured limit. Normal command tasks run until the
+command exits or somebody cancels the task. The client keeps renewing the lease
+for as long as the command remains healthy.
+
+`LEASE UNTIL` is the daemon's current safety deadline for a card lock. For a
+normal command task, heartbeat renewals continually move it forward. It becomes
+the actual release time only if the client disappears without releasing.
+
+To reserve cards without wrapping a command, create a raw timed reservation:
+
+```bash
+gpuctl grab --cards 1 --for 2h
+gpuctl grab --count 2 --for 30m
+```
+
+`grab` waits in the same FIFO queue. Its duration starts only after all requested
+cards have been allocated. It then prints the task ID, allocated cards, and fixed
+end time before returning:
+
+```text
+Reserved cards 1 until 2026-08-27T16:00:00.000Z (task 7ac91f4e80a6fd21).
+```
+
+The reservation is stored by the daemon, so it remains active after the `grab`
+process exits. Its status is `reserved`, and its `UNTIL` value is fixed rather
+than renewed. The daemon releases the cards automatically at that time.
+
+Use JSON output for scripting:
+
+```bash
+gpuctl grab --count 1 --for 45m --json
+```
+
+Cancel a reservation before its deadline with the normal task interface:
+
+```bash
+gpuctl cancel 7ac91f4e80a6fd21
+```
+
+A raw reservation controls only the cooperative lock. Any GPU processes started
+separately are outside the wrapper, so canceling or expiring the reservation
+does not terminate those processes.
+
 ## Agent workflow for GPU tasks
 
 The bundled skill requires agents to follow this workflow:
@@ -360,6 +409,9 @@ The bundled skill requires agents to follow this workflow:
    mechanisms. The lease is released when the wrapper exits.
 7. To stop a task, find its ID with `gpuctl status` or `gpuctl jobs`, then run
    `gpuctl cancel TASK_ID`.
+8. Use `gpuctl grab` only when the user explicitly requests a raw timed
+   reservation. Do not use it as a substitute for wrapping an agent-run GPU
+   command, because external processes are not tied to the reservation lifecycle.
 
 Example with consecutive GPU phases:
 
@@ -388,7 +440,9 @@ gpuctl --count 2 --set-cuda-visible-devices -- \
    cannot forcibly kill arbitrary operating-system processes that have detached
    from their wrapper. An administrator must handle that exceptional case with
    system process tools.
-8. The wrapped command's exit status is preserved. Exit code `125` indicates a
+8. Raw `grab` reservations have a fixed server-enforced deadline and do not
+   depend on lease heartbeat after allocation.
+9. The wrapped command's exit status is preserved. Exit code `125` indicates a
    `gpuctl` infrastructure failure. Exit codes `126` and `127` indicate that the
    command is not executable or was not found.
 

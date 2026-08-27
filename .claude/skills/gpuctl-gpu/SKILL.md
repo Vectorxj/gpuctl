@@ -86,6 +86,21 @@ gpuctl --count 2 --set-cuda-visible-devices -- \
 
 Do not start a second `gpuctl` request from inside an active lease.
 
+## Raw timed reservations
+
+Use a raw reservation only when the user explicitly asks to hold cards for a
+fixed period without wrapping a command:
+
+```bash
+gpuctl grab --cards 1 --for 2h
+gpuctl grab --count 2 --for 30m
+```
+
+The daemon retains the reservation after `grab` returns and releases it at the
+fixed deadline. Do not use `grab` as a substitute for wrapping an agent-run GPU
+workload: commands started outside the wrapper are not terminated when the
+reservation is canceled or expires.
+
 ## Queueing and failures
 
 - Submit the wrapped command directly; `gpuctld` is the source of truth and will
