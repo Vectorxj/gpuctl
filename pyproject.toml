@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gpuctl"
+version = "0.1.0"
+description = "A small multi-user GPU lease server and command wrapper"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "gpuctl contributors" }]
+dependencies = []
+
+[project.scripts]
+gpuctl = "gpuctl.client:main"
+gpuctld = "gpuctl.server:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+gpuctl = ["skills/*/SKILL.md"]
